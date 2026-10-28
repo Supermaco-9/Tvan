@@ -1,0 +1,356 @@
+name: Build APK v3
+on:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Crear proyecto
+        run: |
+          mkdir -p $(dirname settings.gradle.kts)
+          cat > settings.gradle.kts <<'EOF_FILE'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "TvSender"
+          include(":app")
+          EOF_FILE
+          mkdir -p $(dirname build.gradle.kts)
+          cat > build.gradle.kts <<'EOF_FILE'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF_FILE
+          mkdir -p $(dirname app/build.gradle.kts)
+          cat > app/build.gradle.kts <<'EOF_FILE'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.example.tvsender"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.example.tvsender"
+                  minSdk = 24
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          EOF_FILE
+          mkdir -p $(dirname app/src/main/AndroidManifest.xml)
+          cat > app/src/main/AndroidManifest.xml <<'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+              <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+
+              <application
+                  android:label="Enviar a TV"
+                  android:usesCleartextTraffic="true"
+                  android:theme="@android:style/Theme.DeviceDefault.Light">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                      <!-- Aparece en "Compartir" desde el navegador -->
+                      <intent-filter>
+                          <action android:name="android.intent.action.SEND" />
+                          <category android:name="android.intent.category.DEFAULT" />
+                          <data android:mimeType="text/plain" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF_FILE
+          mkdir -p $(dirname app/src/main/java/com/example/tvsender/Dlna.kt)
+          cat > app/src/main/java/com/example/tvsender/Dlna.kt <<'EOF_FILE'
+          package com.example.tvsender
+
+          import org.w3c.dom.Element
+          import org.xml.sax.InputSource
+          import java.io.StringReader
+          import java.net.*
+          import javax.xml.parsers.DocumentBuilderFactory
+
+          data class Tv(val name: String, val controlUrl: String) {
+              override fun toString() = name
+          }
+
+          object Dlna {
+              private const val AVT = "urn:schemas-upnp-org:service:AVTransport:1"
+
+              /** Busca dispositivos DLNA (SSDP) en la red WiFi. Llamar fuera del hilo principal. */
+              fun discover(timeoutMs: Int = 4000): List<Tv> {
+                  val msg = ("M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\n" +
+                          "MAN: \"ssdp:discover\"\r\nMX: 2\r\nST: $AVT\r\n\r\n").toByteArray()
+                  val locations = linkedSetOf<String>()
+                  DatagramSocket().use { s ->
+                      s.soTimeout = 1000
+                      val group = InetAddress.getByName("239.255.255.250")
+                      repeat(2) { s.send(DatagramPacket(msg, msg.size, group, 1900)) }
+                      val end = System.currentTimeMillis() + timeoutMs
+                      val buf = ByteArray(4096)
+                      while (System.currentTimeMillis() < end) {
+                          try {
+                              val p = DatagramPacket(buf, buf.size)
+                              s.receive(p)
+                              String(p.data, 0, p.length).lines()
+                                  .firstOrNull { it.startsWith("location:", true) }
+                                  ?.substringAfter(":")?.trim()?.let { locations.add(it) }
+                          } catch (_: SocketTimeoutException) { }
+                      }
+                  }
+                  return locations.mapNotNull { runCatching { describe(it) }.getOrNull() }
+              }
+
+              private fun describe(location: String): Tv? {
+                  val conn = URL(location).openConnection().apply { connectTimeout = 3000; readTimeout = 3000 }
+                  val xml = conn.getInputStream().bufferedReader().readText()
+                  val doc = DocumentBuilderFactory.newInstance().newDocumentBuilder()
+                      .parse(InputSource(StringReader(xml)))
+                  val name = doc.getElementsByTagName("friendlyName").item(0)?.textContent ?: "TV"
+                  val services = doc.getElementsByTagName("service")
+                  for (i in 0 until services.length) {
+                      val el = services.item(i) as Element
+                      val type = el.getElementsByTagName("serviceType").item(0)?.textContent ?: continue
+                      if (type.contains("AVTransport")) {
+                          val ctrl = el.getElementsByTagName("controlURL").item(0).textContent.trim()
+                          return Tv(name, URL(URL(location), ctrl).toString())
+                      }
+                  }
+                  return null
+              }
+
+              fun extOf(url: String): String {
+                  val path = url.substringBefore("?").substringAfterLast("/")
+                  val e = path.substringAfterLast(".", "").lowercase()
+                  return if (e.length in 2..4 && e.all { it.isLetterOrDigit() }) e else "mp4"
+              }
+
+              private fun mimeOf(ext: String) = when (ext) {
+                  "m3u8" -> "application/vnd.apple.mpegurl"
+                  "mkv" -> "video/x-matroska"
+                  "avi" -> "video/x-msvideo"
+                  "ts" -> "video/mp2t"
+                  "webm" -> "video/webm"
+                  "mov" -> "video/quicktime"
+                  else -> "video/mp4"
+              }
+
+              /** IP del teléfono en la red del TV. */
+              fun localIpFor(tv: Tv): String {
+                  val host = URL(tv.controlUrl).host
+                  DatagramSocket().use { s ->
+                      s.connect(InetAddress.getByName(host), 9)
+                      return s.localAddress.hostAddress ?: error("No se pudo obtener la IP local")
+                  }
+              }
+
+              /** Envía la URL al TV y le da Play. Llamar fuera del hilo principal. */
+              fun play(tv: Tv, mediaUrl: String, originalUrl: String = mediaUrl) {
+                  val mime = mimeOf(extOf(originalUrl))
+                  val didl = "<DIDL-Lite xmlns=\"urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/\" " +
+                      "xmlns:dc=\"http://purl.org/dc/elements/1.1/\" " +
+                      "xmlns:upnp=\"urn:schemas-upnp-org:metadata-1-0/upnp/\">" +
+                      "<item id=\"0\" parentID=\"-1\" restricted=\"1\"><dc:title>Video</dc:title>" +
+                      "<upnp:class>object.item.videoItem</upnp:class>" +
+                      "<res protocolInfo=\"http-get:*:$mime:*\">${esc(mediaUrl)}</res></item></DIDL-Lite>"
+                  soap(tv, "SetAVTransportURI",
+                      "<CurrentURI>${esc(mediaUrl)}</CurrentURI><CurrentURIMetaData>${esc(didl)}</CurrentURIMetaData>")
+                  soap(tv, "Play", "<Speed>1</Speed>")
+              }
+
+              fun stop(tv: Tv) = soap(tv, "Stop", "")
+
+              private fun esc(s: String) = s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\"", "&quot;")
+
+              private fun soap(tv: Tv, action: String, args: String) {
+                  val body = """<?xml version="1.0"?>
+          <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/"><s:Body><u:$action xmlns:u="$AVT"><InstanceID>0</InstanceID>$args</u:$action></s:Body></s:Envelope>"""
+                  val c = URL(tv.controlUrl).openConnection() as HttpURLConnection
+                  c.requestMethod = "POST"
+                  c.doOutput = true
+                  c.connectTimeout = 4000
+                  c.readTimeout = 6000
+                  c.setRequestProperty("Content-Type", "text/xml; charset=\"utf-8\"")
+                  c.setRequestProperty("SOAPAction", "\"$AVT#$action\"")
+                  c.outputStream.use { it.write(body.toByteArray()) }
+                  if (c.responseCode !in 200..299) {
+                      val err = runCatching { c.errorStream?.bufferedReader()?.readText() }.getOrNull() ?: ""
+                      val code = Regex("<errorCode>(.*?)</errorCode>").find(err)?.groupValues?.get(1)
+                      val desc = Regex("<errorDescription>(.*?)</errorDescription>").find(err)?.groupValues?.get(1)
+                      error("$action: HTTP ${c.responseCode}" + (code?.let { " (UPnP $it ${desc ?: ""})" } ?: ""))
+                  }
+              }
+          }
+          EOF_FILE
+          mkdir -p $(dirname app/src/main/java/com/example/tvsender/Proxy.kt)
+          cat > app/src/main/java/com/example/tvsender/Proxy.kt <<'EOF_FILE'
+          package com.example.tvsender
+
+          import java.net.HttpURLConnection
+          import java.net.ServerSocket
+          import java.net.Socket
+          import java.net.URL
+          import kotlin.concurrent.thread
+
+          /** Servidor HTTP mínimo: el TV pide el video al teléfono y el teléfono lo baja de internet (https). */
+          object Proxy {
+              private var server: ServerSocket? = null
+              @Volatile var target: String = ""
+
+              @Synchronized
+              fun start(): Int {
+                  server?.let { return it.localPort }
+                  val ss = ServerSocket(0)
+                  server = ss
+                  thread(isDaemon = true) {
+                      while (!ss.isClosed) {
+                          val c = try { ss.accept() } catch (e: Exception) { break }
+                          thread(isDaemon = true) {
+                              try { handle(c) } catch (_: Exception) { } finally { runCatching { c.close() } }
+                          }
+                      }
+                  }
+                  return ss.localPort
+              }
+
+              private fun handle(c: Socket) {
+                  val inp = c.getInputStream().bufferedReader(Charsets.ISO_8859_1)
+                  val reqLine = inp.readLine() ?: return
+                  var range: String? = null
+                  while (true) {
+                      val l = inp.readLine() ?: break
+                      if (l.isEmpty()) break
+                      if (l.startsWith("Range:", true)) range = l.substringAfter(":").trim()
+                  }
+                  val head = reqLine.startsWith("HEAD")
+                  val conn = URL(target).openConnection() as HttpURLConnection
+                  conn.connectTimeout = 8000
+                  conn.readTimeout = 20000
+                  conn.setRequestProperty("User-Agent", "Mozilla/5.0")
+                  if (range != null) conn.setRequestProperty("Range", range)
+                  val code = conn.responseCode
+                  val out = c.getOutputStream()
+                  val sb = StringBuilder("HTTP/1.1 $code ${conn.responseMessage ?: "OK"}\r\n")
+                  for (h in listOf("Content-Type", "Content-Length", "Content-Range", "Accept-Ranges")) {
+                      conn.getHeaderField(h)?.let { sb.append("$h: $it\r\n") }
+                  }
+                  sb.append("transferMode.dlna.org: Streaming\r\nConnection: close\r\n\r\n")
+                  out.write(sb.toString().toByteArray())
+                  if (!head) (if (code >= 400) conn.errorStream else conn.inputStream)?.use { it.copyTo(out) }
+                  out.flush()
+              }
+          }
+          EOF_FILE
+          mkdir -p $(dirname app/src/main/java/com/example/tvsender/MainActivity.kt)
+          cat > app/src/main/java/com/example/tvsender/MainActivity.kt <<'EOF_FILE'
+          package com.example.tvsender
+
+          import android.app.Activity
+          import android.content.Intent
+          import android.net.wifi.WifiManager
+          import android.os.Bundle
+          import android.widget.*
+          import kotlin.concurrent.thread
+
+          class MainActivity : Activity() {
+              private val tvs = mutableListOf<Tv>()
+              private lateinit var adapter: ArrayAdapter<Tv>
+              private lateinit var spinner: Spinner
+              private lateinit var urlBox: EditText
+              private lateinit var status: TextView
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val pad = (16 * resources.displayMetrics.density).toInt()
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(pad, pad * 3, pad, pad)
+                  }
+                  val scan = Button(this).apply { text = "Buscar TVs"; setOnClickListener { scan() } }
+                  adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, tvs)
+                  spinner = Spinner(this).apply { this.adapter = this@MainActivity.adapter }
+                  urlBox = EditText(this).apply { hint = "Pega el enlace del video (mp4, m3u8…)" }
+                  val send = Button(this).apply { text = "Enviar al TV"; setOnClickListener { send() } }
+                  val stop = Button(this).apply { text = "Detener"; setOnClickListener { stop() } }
+                  status = TextView(this).apply { text = "Toca «Buscar TVs»"; setPadding(0, pad, 0, 0) }
+                  listOf(scan, spinner, urlBox, send, stop, status).forEach { root.addView(it) }
+                  setContentView(root)
+
+                  // Enlace compartido desde el navegador
+                  if (intent?.action == Intent.ACTION_SEND) {
+                      urlBox.setText(intent.getStringExtra(Intent.EXTRA_TEXT) ?: "")
+                  }
+                  scan()
+              }
+
+              private fun scan() {
+                  status.text = "Buscando TVs…"
+                  thread {
+                      val wifi = applicationContext.getSystemService(WIFI_SERVICE) as WifiManager
+                      val lock = wifi.createMulticastLock("dlna").apply { acquire() }
+                      val found = try { Dlna.discover() } catch (e: Exception) { emptyList() } finally { lock.release() }
+                      runOnUiThread {
+                          tvs.clear(); tvs.addAll(found); adapter.notifyDataSetChanged()
+                          status.text = if (found.isEmpty()) "No se encontró ningún TV (¿mismo WiFi?)"
+                          else "${found.size} TV(s) encontrado(s)"
+                      }
+                  }
+              }
+
+              private fun send() {
+                  val tv = spinner.selectedItem as? Tv ?: return toast("Elige un TV primero")
+                  val url = urlBox.text.toString().trim()
+                  if (url.isEmpty()) return toast("Pega un enlace")
+                  run("Enviando…", "Reproduciendo en ${tv.name} (deja la app abierta)") {
+                      var playUrl = url
+                      if (url.startsWith("https", true)) {
+                          // Muchos TVs no soportan https: el teléfono hace de puente
+                          Proxy.target = url
+                          val port = Proxy.start()
+                          playUrl = "http://${Dlna.localIpFor(tv)}:$port/video.${Dlna.extOf(url)}"
+                      }
+                      Dlna.play(tv, playUrl, url)
+                  }
+              }
+
+              private fun stop() {
+                  val tv = spinner.selectedItem as? Tv ?: return
+                  run("Deteniendo…", "Detenido") { Dlna.stop(tv) }
+              }
+
+              private fun run(busy: String, ok: String, block: () -> Unit) {
+                  status.text = busy
+                  thread {
+                      val msg = try { block(); ok } catch (e: Exception) { "Error: ${e.message}" }
+                      runOnUiThread { status.text = msg }
+                  }
+              }
+
+              private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_SHORT).show()
+          }
+          EOF_FILE
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - name: Aceptar licencias
+        run: yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses > /dev/null || true
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.9
+      - run: gradle assembleDebug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TvSender-apk-v3
+          path: app/build/outputs/apk/debug/app-debug.apk
