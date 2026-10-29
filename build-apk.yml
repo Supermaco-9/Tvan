@@ -1,0 +1,577 @@
+name: Build APK v5
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Crear proyecto
+        run: |
+          cat > settings.gradle.kts <<'EOF_FILE'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "TvSender"
+          include(":app")
+          EOF_FILE
+
+          cat > build.gradle.kts <<'EOF_FILE'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF_FILE
+
+          mkdir -p app/src/main/java/com/example/tvsender
+
+          cat > app/build.gradle.kts <<'EOF_FILE'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.example.tvsender"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.example.tvsender"
+                  minSdk = 24
+                  targetSdk = 34
+                  versionCode = 2
+                  versionName = "2.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          EOF_FILE
+
+          cat > app/src/main/AndroidManifest.xml <<'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+              <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+              <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+              <application
+                  android:label="Enviar a TV"
+                  android:usesCleartextTraffic="true"
+                  android:theme="@android:style/Theme.DeviceDefault.Light">
+
+                  <service
+                      android:name=".ProxyService"
+                      android:foregroundServiceType="dataSync"
+                      android:exported="false" />
+
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                      <intent-filter>
+                          <action android:name="android.intent.action.SEND" />
+                          <category android:name="android.intent.category.DEFAULT" />
+                          <data android:mimeType="text/plain" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF_FILE
+
+          cat > app/src/main/java/com/example/tvsender/Dlna.kt <<'EOF_FILE'
+          package com.example.tvsender
+
+          import org.w3c.dom.Element
+          import org.xml.sax.InputSource
+          import java.io.StringReader
+          import java.net.*
+          import javax.xml.parsers.DocumentBuilderFactory
+
+          data class Tv(val name: String, val controlUrl: String) {
+              override fun toString() = name
+          }
+
+          object Dlna {
+              private const val AVT = "urn:schemas-upnp-org:service:AVTransport:1"
+
+              fun discover(timeoutMs: Int = 4000): List<Tv> {
+                  val msg = ("M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\n" +
+                          "MAN: \"ssdp:discover\"\r\nMX: 2\r\nST: $AVT\r\n\r\n").toByteArray()
+                  val locations = linkedSetOf<String>()
+                  DatagramSocket().use { s ->
+                      s.soTimeout = 1000
+                      val group = InetAddress.getByName("239.255.255.250")
+                      repeat(2) { s.send(DatagramPacket(msg, msg.size, group, 1900)) }
+                      val end = System.currentTimeMillis() + timeoutMs
+                      val buf = ByteArray(4096)
+                      while (System.currentTimeMillis() < end) {
+                          try {
+                              val p = DatagramPacket(buf, buf.size)
+                              s.receive(p)
+                              String(p.data, 0, p.length).lines()
+                                  .firstOrNull { it.startsWith("location:", true) }
+                                  ?.substringAfter(":")?.trim()?.let { locations.add(it) }
+                          } catch (_: SocketTimeoutException) { }
+                      }
+                  }
+                  return locations.mapNotNull { runCatching { describe(it) }.getOrNull() }
+              }
+
+              private fun describe(location: String): Tv? {
+                  val conn = URL(location).openConnection().apply { connectTimeout = 3000; readTimeout = 3000 }
+                  val xml = conn.getInputStream().bufferedReader().readText()
+                  val doc = DocumentBuilderFactory.newInstance().newDocumentBuilder()
+                      .parse(InputSource(StringReader(xml)))
+                  val name = doc.getElementsByTagName("friendlyName").item(0)?.textContent ?: "TV"
+                  val services = doc.getElementsByTagName("service")
+                  for (i in 0 until services.length) {
+                      val el = services.item(i) as Element
+                      val type = el.getElementsByTagName("serviceType").item(0)?.textContent ?: continue
+                      if (type.contains("AVTransport")) {
+                          val ctrl = el.getElementsByTagName("controlURL").item(0).textContent.trim()
+                          return Tv(name, URL(URL(location), ctrl).toString())
+                      }
+                  }
+                  return null
+              }
+
+              data class Media(val ext: String, val mime: String, val kind: String, val hls: Boolean)
+
+              fun probe(url: String): Media {
+                  val cleanUrl = url.substringBefore("?").substringBefore("#").lowercase()
+                  val isHls = cleanUrl.endsWith(".m3u8") || cleanUrl.endsWith(".m3u") || url.contains("hls") || url.contains("master")
+                  if (isHls) return Media("ts", "video/mpeg", "video", true)
+
+                  return Media("mp4", "video/mp4", "video", false)
+              }
+
+              fun localIpFor(tv: Tv): String {
+                  val host = URL(tv.controlUrl).host
+                  DatagramSocket().use { s ->
+                      s.connect(InetAddress.getByName(host), 9)
+                      return s.localAddress.hostAddress ?: error("No se pudo obtener la IP local")
+                  }
+              }
+
+              fun play(tv: Tv, mediaUrl: String, m: Media) {
+                  val didl = "<DIDL-Lite xmlns=\"urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/\" " +
+                          "xmlns:dc=\"http://purl.org/dc/elements/1.1/\" " +
+                          "xmlns:upnp=\"urn:schemas-upnp-org:metadata-1-0/upnp/\">" +
+                          "<item id=\"0\" parentID=\"-1\" restricted=\"1\">" +
+                          "<dc:title>Transmisión de Video</dc:title>" +
+                          "<upnp:class>object.item.videoItem</upnp:class>" +
+                          "<res protocolInfo=\"http-get:*:${m.mime}:*\">${esc(mediaUrl)}</res>" +
+                          "</item></DIDL-Lite>"
+                  soap(tv, "SetAVTransportURI",
+                      "<CurrentURI>${esc(mediaUrl)}</CurrentURI><CurrentURIMetaData>${esc(didl)}</CurrentURIMetaData>")
+                  soap(tv, "Play", "<Speed>1</Speed>")
+              }
+
+              fun stop(tv: Tv) = soap(tv, "Stop", "")
+
+              private fun esc(s: String) = s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\"", "&quot;")
+
+              private fun soap(tv: Tv, action: String, args: String) {
+                  val body = """<?xml version="1.0"?>
+          <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/"><s:Body><u:$action xmlns:u="$AVT"><InstanceID>0</InstanceID>$args</u:$action></s:Body></s:Envelope>"""
+                  val c = URL(tv.controlUrl).openConnection() as HttpURLConnection
+                  c.requestMethod = "POST"
+                  c.doOutput = true
+                  c.connectTimeout = 5000
+                  c.readTimeout = 7000
+                  c.setRequestProperty("Content-Type", "text/xml; charset=\"utf-8\"")
+                  c.setRequestProperty("SOAPAction", "\"$AVT#$action\"")
+                  c.outputStream.use { it.write(body.toByteArray()) }
+                  if (c.responseCode !in 200..299) {
+                      val err = runCatching { c.errorStream?.bufferedReader()?.readText() }.getOrNull() ?: ""
+                      val code = Regex("<errorCode>(.*?)</errorCode>").find(err)?.groupValues?.get(1)
+                      val desc = Regex("<errorDescription>(.*?)</errorDescription>").find(err)?.groupValues?.get(1)
+                      error("$action: HTTP ${c.responseCode}" + (code?.let { " (UPnP $it ${desc ?: ""})" } ?: ""))
+                  }
+              }
+          }
+          EOF_FILE
+
+          cat > app/src/main/java/com/example/tvsender/Proxy.kt <<'EOF_FILE'
+          package com.example.tvsender
+
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.Service
+          import android.content.Context
+          import android.content.Intent
+          import android.os.Build
+          import android.os.IBinder
+          import android.os.PowerManager
+          import java.io.OutputStream
+          import java.net.HttpURLConnection
+          import java.net.ServerSocket
+          import java.net.Socket
+          import java.net.URL
+          import kotlin.concurrent.thread
+
+          class ProxyService : Service() {
+              private var wakeLock: PowerManager.WakeLock? = null
+
+              override fun onBind(intent: Intent?): IBinder? = null
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+                  wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "TvSender::ProxyLock").apply {
+                      acquire(10 * 60 * 60 * 1000L) // Mantiene despierto el procesador hasta por 10 horas
+                  }
+
+                  val channelId = "tv_sender_channel_v2"
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                      val channel = NotificationChannel(channelId, "Streaming Continuo a TV", NotificationManager.IMPORTANCE_LOW)
+                      getSystemService(NotificationManager::class.java)?.createNotificationChannel(channel)
+                  }
+                  val notification = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                      android.app.Notification.Builder(this, channelId)
+                          .setContentTitle("Transmitiendo video al TV")
+                          .setContentText("Proxy Universal Activo - Manteniendo conexión")
+                          .setSmallIcon(android.R.drawable.ic_media_play)
+                          .build()
+                  } else {
+                      @Suppress("DEPRECATION")
+                      android.app.Notification.Builder(this)
+                          .setContentTitle("Transmitiendo video al TV")
+                          .setContentText("Proxy Universal Activo")
+                          .setSmallIcon(android.R.drawable.ic_media_play)
+                          .build()
+                  }
+                  startForeground(102, notification)
+                  return START_STICKY
+              }
+
+              override fun onDestroy() {
+                  runCatching { wakeLock?.release() }
+                  super.onDestroy()
+              }
+          }
+
+          object Proxy {
+              private var server: ServerSocket? = null
+              @Volatile var target: String = ""
+              @Volatile var isHls: Boolean = false
+
+              @Synchronized
+              fun start(): Int {
+                  server?.let { return it.localPort }
+                  val ss = ServerSocket(0)
+                  server = ss
+                  thread(isDaemon = true) {
+                      while (!ss.isClosed) {
+                          val c = try { ss.accept() } catch (e: Exception) { break }
+                          thread(isDaemon = true) {
+                              try { handle(c) } catch (_: Exception) { } finally { runCatching { c.close() } }
+                          }
+                      }
+                  }
+                  return ss.localPort
+              }
+
+              private fun openConnection(urlStr: String): HttpURLConnection {
+                  val url = URL(urlStr)
+                  val conn = url.openConnection() as HttpURLConnection
+                  conn.connectTimeout = 12000
+                  conn.readTimeout = 30000
+                  conn.instanceFollowRedirects = true
+                  conn.setRequestProperty("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+                  conn.setRequestProperty("Accept", "*/*")
+                  conn.setRequestProperty("Accept-Language", "en-US,en;q=0.9,es;q=0.8")
+                  conn.setRequestProperty("Connection", "keep-alive")
+                  return conn
+              }
+
+              private fun handle(c: Socket) {
+                  val inp = c.getInputStream().bufferedReader(Charsets.ISO_8859_1)
+                  val reqLine = inp.readLine() ?: return
+                  var range: String? = null
+                  while (true) {
+                      val l = inp.readLine() ?: break
+                      if (l.isEmpty()) break
+                      if (l.startsWith("Range:", true)) range = l.substringAfter(":").trim()
+                  }
+                  val head = reqLine.startsWith("HEAD")
+                  val out = c.getOutputStream()
+
+                  if (isHls) {
+                      streamHlsContinuous(out, head)
+                      return
+                  }
+
+                  streamDirectWithRetry(out, head, range)
+              }
+
+              private fun streamDirectWithRetry(out: OutputStream, head: Boolean, range: String?) {
+                  var retries = 0
+                  val maxRetries = 5
+                  while (retries < maxRetries) {
+                      try {
+                          val conn = openConnection(target)
+                          if (range != null) conn.setRequestProperty("Range", range)
+                          val code = conn.responseCode
+
+                          val sb = StringBuilder("HTTP/1.1 $code ${conn.responseMessage ?: "OK"}\r\n")
+                          for (h in listOf("Content-Type", "Content-Length", "Content-Range", "Accept-Ranges")) {
+                              conn.getHeaderField(h)?.let { sb.append("$h: $it\r\n") }
+                          }
+                          sb.append("transferMode.dlna.org: Streaming\r\nConnection: keep-alive\r\n\r\n")
+                          out.write(sb.toString().toByteArray())
+
+                          if (!head) {
+                              val stream = if (code >= 400) conn.errorStream else conn.inputStream
+                              stream?.use { it.copyTo(out) }
+                          }
+                          out.flush()
+                          break
+                      } catch (e: Exception) {
+                          retries++
+                          Thread.sleep(1000)
+                      }
+                  }
+              }
+
+              private fun streamHlsContinuous(out: OutputStream, head: Boolean) {
+                  out.write(("HTTP/1.1 200 OK\r\nContent-Type: video/mpeg\r\n" +
+                          "transferMode.dlna.org: Streaming\r\nConnection: keep-alive\r\n\r\n").toByteArray())
+                  if (head) { out.flush(); return }
+
+                  val currentTarget = target
+                  var playlistUrl = currentTarget
+                  var playlistText = ""
+
+                  try {
+                      playlistText = openConnection(playlistUrl).inputStream.bufferedReader().use { it.readText() }
+                  } catch (e: Exception) { return }
+
+                  if (playlistText.contains("#EXT-X-STREAM-INF")) {
+                      val lines = playlistText.lines()
+                      var maxBw = -1L
+                      var bestUri: String? = null
+                      for (i in lines.indices) {
+                          if (lines[i].startsWith("#EXT-X-STREAM-INF")) {
+                              val bw = Regex("BANDWIDTH=(\\d+)").find(lines[i])?.groupValues?.get(1)?.toLong() ?: 0L
+                              val uri = lines.drop(i + 1).firstOrNull { it.isNotBlank() && !it.startsWith("#") }
+                              if (uri != null && bw > maxBw) { maxBw = bw; bestUri = uri.trim() }
+                          }
+                      }
+                      playlistUrl = URL(URL(playlistUrl), bestUri ?: error("Playlist vacía")).toString()
+                  }
+
+                  val processedSegments = LinkedHashSet<String>()
+
+                  while (target == currentTarget) {
+                      try {
+                          val manifestText = openConnection(playlistUrl).inputStream.bufferedReader().use { it.readText() }
+                          val lines = manifestText.lines().map { it.trim() }.filter { it.isNotEmpty() && !it.startsWith("#") }
+
+                          for (seg in lines) {
+                              val segUrl = URL(URL(playlistUrl), seg).toString()
+                              if (processedSegments.add(segUrl)) {
+                                  var downloaded = false
+                                  var segRetries = 0
+                                  while (!downloaded && segRetries < 3) {
+                                      try {
+                                          openConnection(segUrl).inputStream.use { it.copyTo(out) }
+                                          out.flush()
+                                          downloaded = true
+                                      } catch (e: Exception) {
+                                          segRetries++
+                                          Thread.sleep(500)
+                                      }
+                                  }
+                              }
+                          }
+                          if (manifestText.contains("#EXT-X-ENDLIST")) break
+                      } catch (_: Exception) { }
+                      Thread.sleep(1200)
+                  }
+              }
+          }
+          EOF_FILE
+
+          cat > app/src/main/java/com/example/tvsender/MainActivity.kt <<'EOF_FILE'
+          package com.example.tvsender
+
+          import android.app.Activity
+          import android.content.Intent
+          import android.net.wifi.WifiManager
+          import android.os.Bundle
+          import android.view.Gravity
+          import android.widget.*
+          import kotlin.concurrent.thread
+
+          class MainActivity : Activity() {
+              private val tvs = mutableListOf<Tv>()
+              private lateinit var adapter: ArrayAdapter<Tv>
+              private lateinit var spinner: Spinner
+              private lateinit var urlBox: EditText
+              private lateinit var status: TextView
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+
+                  val pad = (16 * resources.displayMetrics.density).toInt()
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(pad * 2, pad * 2, pad * 2, pad * 2)
+                      setBackgroundColor(0xFFF4F6F8.toInt())
+                  }
+
+                  val title = TextView(this).apply {
+                      text = "Universal TV Cast"
+                      textSize = 22f
+                      setTypeface(null, android.graphics.Typeface.BOLD)
+                      setTextColor(0xFF111827.toInt())
+                      setPadding(0, 0, 0, pad)
+                  }
+
+                  val scanButton = Button(this).apply {
+                      text = "🔍 Buscar Televisores"
+                      setOnClickListener { scan() }
+                      setBackgroundColor(0xFF2563EB.toInt())
+                      setTextColor(0xFFFFFFFF.toInt())
+                  }
+
+                  val tvLabel = TextView(this).apply {
+                      text = "Televisor seleccionado:"
+                      textSize = 14f
+                      setTextColor(0xFF4B5563.toInt())
+                      setPadding(0, pad / 2, 0, 4)
+                  }
+
+                  adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, tvs)
+                  spinner = Spinner(this).apply { this.adapter = this@MainActivity.adapter }
+
+                  val urlLabel = TextView(this).apply {
+                      text = "URL de Video Universal (Cualquier servidor / .m3u8 / .mp4):"
+                      textSize = 14f
+                      setTextColor(0xFF4B5563.toInt())
+                      setPadding(0, pad, 0, 4)
+                  }
+
+                  urlBox = EditText(this).apply {
+                      hint = "Pega aquí cualquier enlace de video"
+                      setPadding(pad, pad, pad, pad)
+                      setBackgroundColor(0xFFFFFFFF.toInt())
+                      textSize = 14f
+                  }
+
+                  val sendButton = Button(this).apply {
+                      text = "▶ Transmitir sin Interrupciones"
+                      setOnClickListener { send() }
+                      setBackgroundColor(0xFF16A34A.toInt())
+                      setTextColor(0xFFFFFFFF.toInt())
+                  }
+
+                  val stopButton = Button(this).apply {
+                      text = "⏹ Detener Transmisión"
+                      setOnClickListener { stop() }
+                      setBackgroundColor(0xFFDC2626.toInt())
+                      setTextColor(0xFFFFFFFF.toInt())
+                  }
+
+                  status = TextView(this).apply {
+                      text = "Estado: Preparado para transmitir"
+                      textSize = 14f
+                      setTextColor(0xFF374151.toInt())
+                      setPadding(0, pad, 0, 0)
+                      gravity = Gravity.CENTER_HORIZONTAL
+                  }
+
+                  listOf(title, scanButton, tvLabel, spinner, urlLabel, urlBox, sendButton, stopButton, status).forEach {
+                      root.addView(it, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+                          if (it == sendButton || it == stopButton || it == scanButton) {
+                              setMargins(0, pad / 2, 0, 0)
+                          }
+                      })
+                  }
+
+                  setContentView(root)
+
+                  if (intent?.action == Intent.ACTION_SEND) {
+                      urlBox.setText(intent.getStringExtra(Intent.EXTRA_TEXT) ?: "")
+                  }
+                  scan()
+              }
+
+              private fun scan() {
+                  status.text = "Escaneando la red WiFi en busca de Smart TVs..."
+                  thread {
+                      val wifi = applicationContext.getSystemService(WIFI_SERVICE) as WifiManager
+                      val lock = wifi.createMulticastLock("dlna").apply { acquire() }
+                      val found = try { Dlna.discover() } catch (e: Exception) { emptyList() } finally { lock.release() }
+                      runOnUiThread {
+                          tvs.clear(); tvs.addAll(found); adapter.notifyDataSetChanged()
+                          status.text = if (found.isEmpty()) "⚠️ No se detectó ningún TV en esta red WiFi"
+                          else "✅ Se detectaron ${found.size} televisor(es)"
+                      }
+                  }
+              }
+
+              private fun send() {
+                  val tv = spinner.selectedItem as? Tv ?: return toast("Selecciona un televisor de la lista")
+                  val url = urlBox.text.toString().trim()
+                  if (url.isEmpty()) return toast("Por favor ingresa un enlace de video")
+
+                  try {
+                      startService(Intent(this, ProxyService::class.java))
+                  } catch (_: Exception) {}
+
+                  status.text = "Iniciando Proxy Universal y enviando transmisión..."
+                  thread {
+                      val msg = try {
+                          val media = Dlna.probe(url)
+
+                          Proxy.target = url
+                          Proxy.isHls = media.hls
+                          val port = Proxy.start()
+                          val playUrl = "http://${Dlna.localIpFor(tv)}:$port/stream.${media.ext}"
+
+                          Dlna.play(tv, playUrl, media)
+                          "▶ Reproduciendo en ${tv.name} (Modo Indestructible Activo)"
+                      } catch (e: Exception) {
+                          "❌ Error de conexión: ${e.message}"
+                      }
+                      runOnUiThread { status.text = msg }
+                  }
+              }
+
+              private fun stop() {
+                  val tv = spinner.selectedItem as? Tv ?: return
+                  thread {
+                      runCatching { Dlna.stop(tv) }
+                      runCatching { stopService(Intent(this@MainActivity, ProxyService::class.java)) }
+                      runOnUiThread { status.text = "⏹ Transmisión detenida correctamente" }
+                  }
+              }
+
+              private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_SHORT).show()
+          }
+          EOF_FILE
+
+      - name: Aceptar licencias
+        run: yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses > /dev/null || true
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.9
+
+      - run: gradle assembleDebug
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TvSender-Universal-v5
+          path: app/build/outputs/apk/debug/app-debug.apk
